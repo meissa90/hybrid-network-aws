@@ -1,0 +1,1751 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS SAA graduation project 4 - Hybrid cloud connectivity: Transit Gateway hub with segmented route
+  tables (Shared Services, Dev, Staging, Prod), Site-to-Site VPN with BGP to a simulated on-premises
+  data center, Route 53 Resolver inbound/outbound endpoints for hybrid DNS, optional centralized
+  inspection with AWS Network Firewall, optional AWS RAM sharing, and VPN tunnel alarms.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: General }
+        Parameters: [ProjectName, AlertEmail]
+      - Label: { default: Routing }
+        Parameters: [AmazonSideAsn, CustomerSideAsn]
+      - Label: { default: Optional features }
+        Parameters: [EnableNetworkFirewall, SharePrincipal]
+      - Label: { default: Instances }
+        Parameters: [InstanceType, AmazonLinuxAmiId, UbuntuAmiId]
+    ParameterLabels:
+      EnableNetworkFirewall: { default: Enable centralized inspection with AWS Network Firewall (extra cost) }
+      SharePrincipal: { default: Share the Transit Gateway and resolver rule with (AWS RAM) }
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: hybrid-net
+    AllowedPattern: '^[a-z][a-z0-9-]{2,19}$'
+    Description: Lowercase prefix for resource names (3-20 characters).
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional email for VPN tunnel alarms. Leave empty to skip alarms.
+  AmazonSideAsn:
+    Type: Number
+    Default: 64512
+    Description: Private BGP ASN for the AWS side (Transit Gateway).
+  CustomerSideAsn:
+    Type: Number
+    Default: 65000
+    Description: Private BGP ASN for the simulated on-premises router (customer gateway).
+  EnableNetworkFirewall:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      true = route all traffic through an inspection VPC with AWS Network Firewall (about USD 10/day extra).
+      false = segmentation is enforced by Transit Gateway route tables only.
+  SharePrincipal:
+    Type: String
+    Default: ''
+    Description: Optional 12-digit AWS account ID or AWS Organizations ARN to share the Transit Gateway and resolver rule with.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+  AmazonLinuxAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  UbuntuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Ubuntu 24.04 for the simulated customer gateway (strongSwan + FRR + Unbound).
+
+Conditions:
+  UseFirewall: !Equals [!Ref EnableNetworkFirewall, 'true']
+  NoFirewall: !Not [!Equals [!Ref EnableNetworkFirewall, 'true']]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  HasSharePrincipal: !Not [!Equals [!Ref SharePrincipal, '']]
+
+Resources:
+  # ===========================================================================
+  # Shared building blocks
+  # ===========================================================================
+  BaseLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-base'
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          InstanceMetadataTags: enabled
+
+  SsmInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+
+  SsmInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref SsmInstanceRole]
+
+  # ===========================================================================
+  # Simulated on-premises data center (VPC 172.16.0.0/16, not attached to the TGW)
+  # ===========================================================================
+  OnPremVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.16.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-onprem-dc' }
+
+  OnPremIgw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-onprem-igw' }
+
+  OnPremIgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref OnPremVpc
+      InternetGatewayId: !Ref OnPremIgw
+
+  OnPremDmzSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref OnPremVpc
+      CidrBlock: 172.16.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-onprem-dmz' }
+
+  OnPremLanSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref OnPremVpc
+      CidrBlock: 172.16.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-onprem-lan' }
+
+  OnPremDmzRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref OnPremVpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-onprem-dmz-rt' }
+
+  OnPremDmzDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: OnPremIgwAttachment
+    Properties:
+      RouteTableId: !Ref OnPremDmzRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref OnPremIgw
+
+  OnPremDmzRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref OnPremDmzSubnet
+      RouteTableId: !Ref OnPremDmzRouteTable
+
+  OnPremLanRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref OnPremVpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-onprem-lan-rt' }
+
+  OnPremLanDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: OnPremIgwAttachment
+    Properties:
+      RouteTableId: !Ref OnPremLanRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref OnPremIgw
+
+  # On-prem LAN reaches AWS through the customer gateway router, like a real data center.
+  OnPremLanToAwsRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref OnPremLanRouteTable
+      DestinationCidrBlock: 10.0.0.0/8
+      NetworkInterfaceId: !Ref CgwNetworkInterface
+
+  OnPremLanRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref OnPremLanSubnet
+      RouteTableId: !Ref OnPremLanRouteTable
+
+  CgwSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Customer gateway - IKE/NAT-T from the internet, LAN and AWS traffic for routing and DNS
+      VpcId: !Ref OnPremVpc
+      SecurityGroupIngress:
+        - { IpProtocol: udp, FromPort: 500, ToPort: 500, CidrIp: 0.0.0.0/0, Description: IKE from AWS VPN endpoints }
+        - { IpProtocol: udp, FromPort: 4500, ToPort: 4500, CidrIp: 0.0.0.0/0, Description: IPsec NAT-T from AWS VPN endpoints }
+        - { IpProtocol: '-1', CidrIp: 172.16.0.0/16, Description: On-prem LAN traffic to route into the tunnels }
+        - { IpProtocol: '-1', CidrIp: 10.0.0.0/8, Description: AWS traffic arriving through the tunnels (incl. DNS) }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-cgw-sg' }
+
+  ClientSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: On-prem client - ICMP from AWS VPCs for connectivity tests, no inbound SSH
+      VpcId: !Ref OnPremVpc
+      SecurityGroupIngress:
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 10.0.0.0/8, Description: Ping from AWS workloads }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-client-sg' }
+
+  CgwElasticIp:
+    Type: AWS::EC2::EIP
+    DependsOn: OnPremIgwAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-cgw-eip' }
+
+  CgwNetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref OnPremDmzSubnet
+      PrivateIpAddress: 172.16.1.10
+      GroupSet: [!Ref CgwSecurityGroup]
+      SourceDestCheck: false
+      Description: Customer gateway router interface
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-cgw-eni' }
+
+  CgwEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt CgwElasticIp.AllocationId
+      NetworkInterfaceId: !Ref CgwNetworkInterface
+
+  CustomerGateway:
+    Type: AWS::EC2::CustomerGateway
+    Properties:
+      Type: ipsec.1
+      BgpAsn: !Ref CustomerSideAsn
+      IpAddress: !Ref CgwElasticIp
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-onprem-cgw' }
+
+  # ===========================================================================
+  # Transit Gateway and Site-to-Site VPN
+  # ===========================================================================
+  TransitGateway:
+    Type: AWS::EC2::TransitGateway
+    Properties:
+      Description: !Sub '${ProjectName} hub'
+      AmazonSideAsn: !Ref AmazonSideAsn
+      DefaultRouteTableAssociation: disable
+      DefaultRouteTablePropagation: disable
+      AutoAcceptSharedAttachments: disable
+      DnsSupport: enable
+      VpnEcmpSupport: enable
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-tgw' }
+
+  VpnConnection:
+    Type: AWS::EC2::VPNConnection
+    Properties:
+      Type: ipsec.1
+      CustomerGatewayId: !Ref CustomerGateway
+      TransitGatewayId: !Ref TransitGateway
+      StaticRoutesOnly: false
+      VpnTunnelOptionsSpecifications:
+        - TunnelInsideCidr: 169.254.10.0/30
+        - TunnelInsideCidr: 169.254.11.0/30
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-s2s-vpn' }
+
+  # CloudFormation does not return the TGW attachment ID of a VPN connection, so a small
+  # custom resource looks it up for the route table association and propagations.
+  VpnAttachmentLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: describe-tgw-attachments
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeTransitGatewayAttachments
+                Resource: '*'
+
+  VpnAttachmentLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Returns the Transit Gateway attachment ID of a Site-to-Site VPN connection
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 900
+      Role: !GetAtt VpnAttachmentLookupRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import urllib.request
+
+          import boto3
+
+
+          def send(event, context, status, attachment_id=None, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or "See CloudWatch Logs: " + context.log_stream_name,
+                  "PhysicalResourceId": attachment_id or event.get("PhysicalResourceId", context.log_stream_name),
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {"AttachmentId": attachment_id} if attachment_id else {},
+              }).encode()
+              request = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                               headers={"Content-Type": ""})
+              urllib.request.urlopen(request, timeout=30)
+
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      send(event, context, "SUCCESS")
+                      return
+                  props = event["ResourceProperties"]
+                  ec2 = boto3.client("ec2")
+                  for _ in range(80):
+                      response = ec2.describe_transit_gateway_attachments(Filters=[
+                          {"Name": "resource-id", "Values": [props["VpnConnectionId"]]},
+                          {"Name": "transit-gateway-id", "Values": [props["TransitGatewayId"]]},
+                      ])
+                      for attachment in response["TransitGatewayAttachments"]:
+                          if attachment["State"] == "available":
+                              send(event, context, "SUCCESS", attachment["TransitGatewayAttachmentId"])
+                              return
+                      time.sleep(10)
+                  send(event, context, "FAILED", reason="Timed out waiting for the VPN attachment")
+              except Exception as error:  # report any error back to CloudFormation
+                  send(event, context, "FAILED", reason=str(error))
+
+  VpnAttachmentLookup:
+    Type: Custom::VpnTgwAttachment
+    Properties:
+      ServiceToken: !GetAtt VpnAttachmentLookupFunction.Arn
+      VpnConnectionId: !Ref VpnConnection
+      TransitGatewayId: !Ref TransitGateway
+
+  # ===========================================================================
+  # Simulated on-prem instances
+  # ===========================================================================
+  CgwInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: read-vpn-configuration
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeVpnConnections
+                Resource: '*'
+
+  CgwInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref CgwInstanceRole]
+
+  # Ubuntu router: strongSwan (IPsec, IKEv2), FRR (BGP), Unbound (on-prem DNS for corp.example.internal)
+  CustomerGatewayInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: [CgwEipAssociation, OnPremDmzDefaultRoute]
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref BaseLaunchTemplate
+        Version: !GetAtt BaseLaunchTemplate.LatestVersionNumber
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref CgwInstanceProfile
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref CgwNetworkInterface
+          DeviceIndex: '0'
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-onprem-cgw-router' }
+        - { Key: Project, Value: !Ref ProjectName }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # No "set -x": the tunnel pre-shared keys must not be written to the boot log.
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          # 1. Packages: strongSwan (IPsec), FRR (BGP), Unbound (DNS), boto3 (read the VPN configuration)
+          apt-get update -y
+          apt-get install -y charon-systemd strongswan-swanctl frr unbound python3-boto3 iptables
+
+          # 2. Turn the instance into a router
+          cat > /etc/sysctl.d/90-vpn-router.conf <<'EOF'
+          net.ipv4.ip_forward = 1
+          net.ipv4.conf.all.rp_filter = 0
+          net.ipv4.conf.default.rp_filter = 0
+          EOF
+          sysctl --system
+
+          # 3. Read both tunnels (outside IPs, inside IPs, pre-shared keys) from the VPN connection
+          cat > /usr/local/bin/get-vpn-config.py <<'EOF'
+          import sys
+          import time
+          import xml.etree.ElementTree as ET
+
+          import boto3
+
+          vpn_id, region = sys.argv[1], sys.argv[2]
+          ec2 = boto3.client("ec2", region_name=region)
+          for _ in range(90):
+              vpn = ec2.describe_vpn_connections(VpnConnectionIds=[vpn_id])["VpnConnections"][0]
+              config = vpn.get("CustomerGatewayConfiguration")
+              if config:
+                  tunnels = ET.fromstring(config.encode()).findall("ipsec_tunnel")
+                  if len(tunnels) == 2:
+                      for number, tunnel in enumerate(tunnels, start=1):
+                          print("T%d_OUTSIDE=%s" % (number, tunnel.findtext("vpn_gateway/tunnel_outside_address/ip_address")))
+                          print("T%d_AWS_INSIDE=%s" % (number, tunnel.findtext("vpn_gateway/tunnel_inside_address/ip_address")))
+                          print("T%d_CGW_INSIDE=%s" % (number, tunnel.findtext("customer_gateway/tunnel_inside_address/ip_address")))
+                          print("T%d_PSK='%s'" % (number, tunnel.findtext("ike/pre_shared_key")))
+                      sys.exit(0)
+              time.sleep(10)
+          sys.exit("VPN configuration was not available in time")
+          EOF
+          python3 /usr/local/bin/get-vpn-config.py ${VpnConnection} ${AWS::Region} > /etc/vpn-tunnels.env
+          chmod 600 /etc/vpn-tunnels.env
+          source /etc/vpn-tunnels.env
+
+          PUBLIC_IP=${CgwElasticIp}
+          LOCAL_IP=172.16.1.10
+          IFACE=$(ip route show default | awk '{print $5; exit}')
+
+          # 4. Route-based VPN: one XFRM interface per tunnel, recreated at every boot
+          cat > /usr/local/bin/vpn-interfaces.sh <<EOF
+          #!/bin/bash
+          ip link add xfrm1 type xfrm dev $IFACE if_id 1 2>/dev/null || true
+          ip link add xfrm2 type xfrm dev $IFACE if_id 2 2>/dev/null || true
+          ip addr replace $T1_CGW_INSIDE/30 dev xfrm1
+          ip addr replace $T2_CGW_INSIDE/30 dev xfrm2
+          ip link set xfrm1 mtu 1419 up
+          ip link set xfrm2 mtu 1419 up
+          iptables -t mangle -C FORWARD -o xfrm+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1379 2>/dev/null || \
+            iptables -t mangle -A FORWARD -o xfrm+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1379
+          EOF
+          chmod 755 /usr/local/bin/vpn-interfaces.sh
+
+          cat > /etc/systemd/system/vpn-interfaces.service <<'EOF'
+          [Unit]
+          Description=XFRM interfaces for the AWS VPN tunnels
+          After=network-online.target
+          Wants=network-online.target
+          Before=strongswan.service frr.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/bin/vpn-interfaces.sh
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          # 5. strongSwan: two IKEv2 tunnels, bound to xfrm1/xfrm2. Routing is done by BGP, not by IPsec policies.
+          cat > /etc/strongswan.d/zz-aws-vpn.conf <<'EOF'
+          charon-systemd {
+            install_routes = no
+          }
+          charon {
+            install_routes = no
+          }
+          EOF
+
+          cat > /etc/swanctl/conf.d/aws.conf <<EOF
+          connections {
+            aws-tunnel1 {
+              version = 2
+              local_addrs = $LOCAL_IP
+              remote_addrs = $T1_OUTSIDE
+              proposals = aes128-sha256-modp2048
+              dpd_delay = 10s
+              rekey_time = 8h
+              local {
+                auth = psk
+                id = $PUBLIC_IP
+              }
+              remote {
+                auth = psk
+                id = $T1_OUTSIDE
+              }
+              children {
+                aws-tunnel1 {
+                  local_ts = 0.0.0.0/0
+                  remote_ts = 0.0.0.0/0
+                  esp_proposals = aes128-sha256-modp2048
+                  if_id_in = 1
+                  if_id_out = 1
+                  rekey_time = 1h
+                  start_action = start
+                  dpd_action = restart
+                  close_action = start
+                }
+              }
+            }
+            aws-tunnel2 {
+              version = 2
+              local_addrs = $LOCAL_IP
+              remote_addrs = $T2_OUTSIDE
+              proposals = aes128-sha256-modp2048
+              dpd_delay = 10s
+              rekey_time = 8h
+              local {
+                auth = psk
+                id = $PUBLIC_IP
+              }
+              remote {
+                auth = psk
+                id = $T2_OUTSIDE
+              }
+              children {
+                aws-tunnel2 {
+                  local_ts = 0.0.0.0/0
+                  remote_ts = 0.0.0.0/0
+                  esp_proposals = aes128-sha256-modp2048
+                  if_id_in = 2
+                  if_id_out = 2
+                  rekey_time = 1h
+                  start_action = start
+                  dpd_action = restart
+                  close_action = start
+                }
+              }
+            }
+          }
+          secrets {
+            ike-tunnel1 {
+              id-1 = $PUBLIC_IP
+              id-2 = $T1_OUTSIDE
+              secret = "$T1_PSK"
+            }
+            ike-tunnel2 {
+              id-1 = $PUBLIC_IP
+              id-2 = $T2_OUTSIDE
+              secret = "$T2_PSK"
+            }
+          }
+          EOF
+          chmod 600 /etc/swanctl/conf.d/aws.conf
+
+          # 6. FRR: eBGP to the Transit Gateway over both tunnels (ECMP), filtered in both directions
+          sed -i 's/^bgpd=no/bgpd=yes/' /etc/frr/daemons
+          cat > /etc/frr/frr.conf <<EOF
+          frr defaults traditional
+          hostname onprem-cgw
+          log syslog informational
+          !
+          ip route 172.16.0.0/16 172.16.1.1
+          !
+          ip prefix-list FROM-AWS seq 10 permit 10.0.0.0/8 le 24
+          ip prefix-list TO-AWS seq 10 permit 172.16.0.0/16
+          !
+          route-map FROM-AWS permit 10
+           match ip address prefix-list FROM-AWS
+          !
+          route-map TO-AWS permit 10
+           match ip address prefix-list TO-AWS
+          !
+          router bgp ${CustomerSideAsn}
+           bgp router-id 172.16.1.10
+           no bgp ebgp-requires-policy
+           neighbor $T1_AWS_INSIDE remote-as ${AmazonSideAsn}
+           neighbor $T1_AWS_INSIDE timers 10 30
+           neighbor $T2_AWS_INSIDE remote-as ${AmazonSideAsn}
+           neighbor $T2_AWS_INSIDE timers 10 30
+           !
+           address-family ipv4 unicast
+            network 172.16.0.0/16
+            maximum-paths 2
+            neighbor $T1_AWS_INSIDE route-map FROM-AWS in
+            neighbor $T1_AWS_INSIDE route-map TO-AWS out
+            neighbor $T2_AWS_INSIDE route-map FROM-AWS in
+            neighbor $T2_AWS_INSIDE route-map TO-AWS out
+           exit-address-family
+          !
+          EOF
+          chown frr:frr /etc/frr/frr.conf
+
+          # 7. Unbound: authoritative for corp.example.internal, forwards aws.example.internal to the
+          #    Route 53 Resolver inbound endpoint (through the VPN), everything else to Amazon DNS.
+          cat > /etc/unbound/unbound.conf.d/onprem-dns.conf <<'EOF'
+          server:
+            interface: 172.16.1.10
+            access-control: 172.16.0.0/16 allow
+            access-control: 10.0.0.0/8 allow
+            domain-insecure: "example.internal."
+            local-zone: "corp.example.internal." static
+            local-data: "dns.corp.example.internal. 300 IN A 172.16.1.10"
+            local-data: "fileserver.corp.example.internal. 300 IN A 172.16.2.20"
+
+          forward-zone:
+            name: "aws.example.internal."
+            forward-addr: 10.0.1.10
+            forward-addr: 10.0.2.10
+
+          forward-zone:
+            name: "."
+            forward-addr: 169.254.169.253
+          EOF
+
+          # 8. Start everything
+          systemctl daemon-reload
+          systemctl enable --now vpn-interfaces.service
+          systemctl enable strongswan
+          systemctl restart strongswan
+          systemctl enable frr
+          systemctl restart frr
+          systemctl enable unbound
+          systemctl restart unbound
+
+  OnPremClientInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: [OnPremLanDefaultRoute, OnPremLanRouteTableAssociation]
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref BaseLaunchTemplate
+        Version: !GetAtt BaseLaunchTemplate.LatestVersionNumber
+      ImageId: !Ref AmazonLinuxAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref SsmInstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref OnPremLanSubnet
+          PrivateIpAddress: 172.16.2.20
+          GroupSet: [!Ref ClientSecurityGroup]
+          AssociatePublicIpAddress: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-onprem-client' }
+        - { Key: Project, Value: !Ref ProjectName }
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf install -y bind-utils traceroute
+          # Send *.example.internal lookups to the on-prem DNS server; everything else is unchanged.
+          mkdir -p /etc/systemd/resolved.conf.d
+          cat > /etc/systemd/resolved.conf.d/onprem-dns.conf <<'EOF'
+          [Resolve]
+          DNS=172.16.1.10
+          Domains=~example.internal
+          EOF
+          systemctl restart systemd-resolved
+
+  # ===========================================================================
+  # AWS VPCs: Shared Services, Dev, Staging, Prod (all attached to the TGW)
+  # ===========================================================================
+  SharedVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-shared-services' }
+
+  SharedSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SharedVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-shared-a' }
+
+  SharedSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SharedVpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-shared-b' }
+
+  SharedRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SharedVpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-shared-rt' }
+
+  SharedSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SharedSubnetA
+      RouteTableId: !Ref SharedRouteTable
+
+  SharedSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SharedSubnetB
+      RouteTableId: !Ref SharedRouteTable
+
+  SharedTgwAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref SharedVpc
+      SubnetIds: [!Ref SharedSubnetA, !Ref SharedSubnetB]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-shared-attachment' }
+
+  SharedToAwsRoute:
+    Type: AWS::EC2::Route
+    DependsOn: SharedTgwAttachment
+    Properties:
+      RouteTableId: !Ref SharedRouteTable
+      DestinationCidrBlock: 10.0.0.0/8
+      TransitGatewayId: !Ref TransitGateway
+
+  SharedToOnPremRoute:
+    Type: AWS::EC2::Route
+    DependsOn: SharedTgwAttachment
+    Properties:
+      RouteTableId: !Ref SharedRouteTable
+      DestinationCidrBlock: 172.16.0.0/16
+      TransitGatewayId: !Ref TransitGateway
+
+  DevVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.10.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-dev' }
+
+  DevSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DevVpc
+      CidrBlock: 10.10.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-dev-a' }
+
+  DevSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DevVpc
+      CidrBlock: 10.10.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-dev-b' }
+
+  DevRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref DevVpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-dev-rt' }
+
+  DevSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DevSubnetA
+      RouteTableId: !Ref DevRouteTable
+
+  DevSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DevSubnetB
+      RouteTableId: !Ref DevRouteTable
+
+  DevTgwAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref DevVpc
+      SubnetIds: [!Ref DevSubnetA, !Ref DevSubnetB]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-dev-attachment' }
+
+  DevToAwsRoute:
+    Type: AWS::EC2::Route
+    DependsOn: DevTgwAttachment
+    Properties:
+      RouteTableId: !Ref DevRouteTable
+      DestinationCidrBlock: 10.0.0.0/8
+      TransitGatewayId: !Ref TransitGateway
+
+  DevToOnPremRoute:
+    Type: AWS::EC2::Route
+    DependsOn: DevTgwAttachment
+    Properties:
+      RouteTableId: !Ref DevRouteTable
+      DestinationCidrBlock: 172.16.0.0/16
+      TransitGatewayId: !Ref TransitGateway
+
+  StagingVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-staging' }
+
+  StagingSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StagingVpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-staging-a' }
+
+  StagingSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StagingVpc
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-staging-b' }
+
+  StagingRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref StagingVpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-staging-rt' }
+
+  StagingSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref StagingSubnetA
+      RouteTableId: !Ref StagingRouteTable
+
+  StagingSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref StagingSubnetB
+      RouteTableId: !Ref StagingRouteTable
+
+  StagingTgwAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref StagingVpc
+      SubnetIds: [!Ref StagingSubnetA, !Ref StagingSubnetB]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-staging-attachment' }
+
+  StagingToAwsRoute:
+    Type: AWS::EC2::Route
+    DependsOn: StagingTgwAttachment
+    Properties:
+      RouteTableId: !Ref StagingRouteTable
+      DestinationCidrBlock: 10.0.0.0/8
+      TransitGatewayId: !Ref TransitGateway
+
+  StagingToOnPremRoute:
+    Type: AWS::EC2::Route
+    DependsOn: StagingTgwAttachment
+    Properties:
+      RouteTableId: !Ref StagingRouteTable
+      DestinationCidrBlock: 172.16.0.0/16
+      TransitGatewayId: !Ref TransitGateway
+
+  ProdVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.30.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-prod' }
+
+  ProdSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProdVpc
+      CidrBlock: 10.30.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-prod-a' }
+
+  ProdSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProdVpc
+      CidrBlock: 10.30.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-prod-b' }
+
+  ProdRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ProdVpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-prod-rt' }
+
+  ProdSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ProdSubnetA
+      RouteTableId: !Ref ProdRouteTable
+
+  ProdSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ProdSubnetB
+      RouteTableId: !Ref ProdRouteTable
+
+  ProdTgwAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref ProdVpc
+      SubnetIds: [!Ref ProdSubnetA, !Ref ProdSubnetB]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-prod-attachment' }
+
+  ProdToAwsRoute:
+    Type: AWS::EC2::Route
+    DependsOn: ProdTgwAttachment
+    Properties:
+      RouteTableId: !Ref ProdRouteTable
+      DestinationCidrBlock: 10.0.0.0/8
+      TransitGatewayId: !Ref TransitGateway
+
+  ProdToOnPremRoute:
+    Type: AWS::EC2::Route
+    DependsOn: ProdTgwAttachment
+    Properties:
+      RouteTableId: !Ref ProdRouteTable
+      DestinationCidrBlock: 172.16.0.0/16
+      TransitGatewayId: !Ref TransitGateway
+
+  # ===========================================================================
+  # Transit Gateway route tables (segmentation)
+  #   on-prem  : VPN          -> reaches Shared, Dev, Staging, Prod
+  #   shared   : Shared VPC   -> reaches everything
+  #   non-prod : Dev, Staging -> reaches Dev, Staging, Shared, on-prem (NOT Prod)
+  #   prod     : Prod         -> reaches Shared, on-prem only (NOT Dev/Staging)
+  # With Network Firewall enabled, the spoke tables send everything to the inspection VPC
+  # and the firewall rules enforce the same segmentation.
+  # ===========================================================================
+  TgwRouteTableOnPrem:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-rt-onprem' }
+
+  TgwRouteTableShared:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-rt-shared' }
+
+  TgwRouteTableNonProd:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-rt-nonprod' }
+
+  TgwRouteTableProd:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-rt-prod' }
+
+  # --- Associations ----------------------------------------------------------
+  AssocVpnToOnPrem:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !GetAtt VpnAttachmentLookup.AttachmentId
+      TransitGatewayRouteTableId: !Ref TgwRouteTableOnPrem
+
+  AssocSharedToShared:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SharedTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableShared
+
+  AssocDevToNonProd:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref DevTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableNonProd
+
+  AssocStagingToNonProd:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref StagingTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableNonProd
+
+  AssocProdToProd:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref ProdTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableProd
+
+  # --- Propagations without the firewall ------------------------------------
+  PropOnPremFromShared:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref SharedTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableOnPrem
+
+  PropOnPremFromDev:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref DevTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableOnPrem
+
+  PropOnPremFromStaging:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref StagingTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableOnPrem
+
+  PropOnPremFromProd:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref ProdTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableOnPrem
+
+  PropSharedFromDev:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref DevTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableShared
+
+  PropSharedFromStaging:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref StagingTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableShared
+
+  PropSharedFromProd:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref ProdTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableShared
+
+  PropSharedFromVpn:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !GetAtt VpnAttachmentLookup.AttachmentId
+      TransitGatewayRouteTableId: !Ref TgwRouteTableShared
+
+  PropNonProdFromDev:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref DevTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableNonProd
+
+  PropNonProdFromStaging:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref StagingTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableNonProd
+
+  PropNonProdFromShared:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref SharedTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableNonProd
+
+  PropNonProdFromVpn:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !GetAtt VpnAttachmentLookup.AttachmentId
+      TransitGatewayRouteTableId: !Ref TgwRouteTableNonProd
+
+  PropProdFromShared:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref SharedTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableProd
+
+  PropProdFromVpn:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: NoFirewall
+    Properties:
+      TransitGatewayAttachmentId: !GetAtt VpnAttachmentLookup.AttachmentId
+      TransitGatewayRouteTableId: !Ref TgwRouteTableProd
+
+  # ===========================================================================
+  # Optional: centralized inspection VPC with AWS Network Firewall
+  # (single firewall endpoint to keep lab cost down - use one per AZ in production)
+  # ===========================================================================
+  InspectionVpc:
+    Type: AWS::EC2::VPC
+    Condition: UseFirewall
+    Properties:
+      CidrBlock: 10.100.0.0/16
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-inspection' }
+
+  InspectionTgwSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: UseFirewall
+    Properties:
+      VpcId: !Ref InspectionVpc
+      CidrBlock: 10.100.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-inspection-tgw-a' }
+
+  InspectionTgwSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: UseFirewall
+    Properties:
+      VpcId: !Ref InspectionVpc
+      CidrBlock: 10.100.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-inspection-tgw-b' }
+
+  InspectionFirewallSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: UseFirewall
+    Properties:
+      VpcId: !Ref InspectionVpc
+      CidrBlock: 10.100.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-inspection-firewall' }
+
+  InspectionTgwAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Condition: UseFirewall
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref InspectionVpc
+      SubnetIds: [!Ref InspectionTgwSubnetA, !Ref InspectionTgwSubnetB]
+      Options:
+        ApplianceModeSupport: enable
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-inspection-attachment' }
+
+  FirewallSegmentationRules:
+    Type: AWS::NetworkFirewall::RuleGroup
+    Condition: UseFirewall
+    Properties:
+      RuleGroupName: !Sub '${ProjectName}-segmentation'
+      Type: STATEFUL
+      Capacity: 100
+      Description: Block non-prod <-> prod, allow everything else
+      RuleGroup:
+        StatefulRuleOptions:
+          RuleOrder: STRICT_ORDER
+        RulesSource:
+          RulesString: |
+            drop ip [10.10.0.0/16,10.20.0.0/16] any -> 10.30.0.0/16 any (msg:"Blocked non-prod to prod"; sid:100; rev:1;)
+            drop ip 10.30.0.0/16 any -> [10.10.0.0/16,10.20.0.0/16] any (msg:"Blocked prod to non-prod"; sid:101; rev:1;)
+            pass ip any any -> any any (msg:"Allowed by segmentation policy"; sid:200; rev:1;)
+
+  FirewallPolicy:
+    Type: AWS::NetworkFirewall::FirewallPolicy
+    Condition: UseFirewall
+    Properties:
+      FirewallPolicyName: !Sub '${ProjectName}-policy'
+      FirewallPolicy:
+        StatelessDefaultActions: ['aws:forward_to_sfe']
+        StatelessFragmentDefaultActions: ['aws:forward_to_sfe']
+        StatefulEngineOptions:
+          RuleOrder: STRICT_ORDER
+        StatefulRuleGroupReferences:
+          - ResourceArn: !Ref FirewallSegmentationRules
+            Priority: 1
+
+  NetworkFirewall:
+    Type: AWS::NetworkFirewall::Firewall
+    Condition: UseFirewall
+    Properties:
+      FirewallName: !Sub '${ProjectName}-firewall'
+      FirewallPolicyArn: !Ref FirewallPolicy
+      VpcId: !Ref InspectionVpc
+      SubnetMappings:
+        - SubnetId: !Ref InspectionFirewallSubnet
+      DeleteProtection: false
+      SubnetChangeProtection: false
+
+  FirewallAlertLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: UseFirewall
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/network-firewall/alert'
+      RetentionInDays: 7
+
+  FirewallLogging:
+    Type: AWS::NetworkFirewall::LoggingConfiguration
+    Condition: UseFirewall
+    Properties:
+      FirewallArn: !Ref NetworkFirewall
+      LoggingConfiguration:
+        LogDestinationConfigs:
+          - LogType: ALERT
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Ref FirewallAlertLogGroup
+
+  InspectionTgwSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: UseFirewall
+    Properties:
+      VpcId: !Ref InspectionVpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-inspection-tgw-rt' }
+
+  InspectionTgwSubnetToFirewallRoute:
+    Type: AWS::EC2::Route
+    Condition: UseFirewall
+    Properties:
+      RouteTableId: !Ref InspectionTgwSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      VpcEndpointId: !Select [1, !Split [':', !Select [0, !GetAtt NetworkFirewall.EndpointIds]]]
+
+  InspectionTgwSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: UseFirewall
+    Properties:
+      SubnetId: !Ref InspectionTgwSubnetA
+      RouteTableId: !Ref InspectionTgwSubnetRouteTable
+
+  InspectionTgwSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: UseFirewall
+    Properties:
+      SubnetId: !Ref InspectionTgwSubnetB
+      RouteTableId: !Ref InspectionTgwSubnetRouteTable
+
+  InspectionFirewallSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: UseFirewall
+    Properties:
+      VpcId: !Ref InspectionVpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-inspection-firewall-rt' }
+
+  InspectionFirewallSubnetToTgwRoute:
+    Type: AWS::EC2::Route
+    Condition: UseFirewall
+    DependsOn: InspectionTgwAttachment
+    Properties:
+      RouteTableId: !Ref InspectionFirewallSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      TransitGatewayId: !Ref TransitGateway
+
+  InspectionFirewallSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: UseFirewall
+    Properties:
+      SubnetId: !Ref InspectionFirewallSubnet
+      RouteTableId: !Ref InspectionFirewallSubnetRouteTable
+
+  TgwRouteTableInspection:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Condition: UseFirewall
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-rt-inspection' }
+
+  AssocInspectionToInspection:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Condition: UseFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref InspectionTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableInspection
+
+  PropInspectionFromShared:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: UseFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref SharedTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableInspection
+
+  PropInspectionFromDev:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: UseFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref DevTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableInspection
+
+  PropInspectionFromStaging:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: UseFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref StagingTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableInspection
+
+  PropInspectionFromProd:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: UseFirewall
+    Properties:
+      TransitGatewayAttachmentId: !Ref ProdTgwAttachment
+      TransitGatewayRouteTableId: !Ref TgwRouteTableInspection
+
+  PropInspectionFromVpn:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Condition: UseFirewall
+    Properties:
+      TransitGatewayAttachmentId: !GetAtt VpnAttachmentLookup.AttachmentId
+      TransitGatewayRouteTableId: !Ref TgwRouteTableInspection
+
+  # Spoke tables send everything to the firewall. The on-prem table uses 10.0.0.0/8 (not 0.0.0.0/0)
+  # because this route is also advertised to the customer gateway over BGP.
+  FwRouteOnPremToInspection:
+    Type: AWS::EC2::TransitGatewayRoute
+    Condition: UseFirewall
+    Properties:
+      TransitGatewayRouteTableId: !Ref TgwRouteTableOnPrem
+      DestinationCidrBlock: 10.0.0.0/8
+      TransitGatewayAttachmentId: !Ref InspectionTgwAttachment
+
+  FwRouteSharedToInspection:
+    Type: AWS::EC2::TransitGatewayRoute
+    Condition: UseFirewall
+    Properties:
+      TransitGatewayRouteTableId: !Ref TgwRouteTableShared
+      DestinationCidrBlock: 0.0.0.0/0
+      TransitGatewayAttachmentId: !Ref InspectionTgwAttachment
+
+  FwRouteNonProdToInspection:
+    Type: AWS::EC2::TransitGatewayRoute
+    Condition: UseFirewall
+    Properties:
+      TransitGatewayRouteTableId: !Ref TgwRouteTableNonProd
+      DestinationCidrBlock: 0.0.0.0/0
+      TransitGatewayAttachmentId: !Ref InspectionTgwAttachment
+
+  FwRouteProdToInspection:
+    Type: AWS::EC2::TransitGatewayRoute
+    Condition: UseFirewall
+    Properties:
+      TransitGatewayRouteTableId: !Ref TgwRouteTableProd
+      DestinationCidrBlock: 0.0.0.0/0
+      TransitGatewayAttachmentId: !Ref InspectionTgwAttachment
+
+  # ===========================================================================
+  # Hybrid DNS: Route 53 Resolver endpoints in the Shared Services VPC
+  # ===========================================================================
+  ResolverInboundSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Route 53 Resolver inbound endpoint - DNS from on-prem
+      VpcId: !Ref SharedVpc
+      SecurityGroupIngress:
+        - { IpProtocol: udp, FromPort: 53, ToPort: 53, CidrIp: 172.16.0.0/16, Description: DNS from on-prem }
+        - { IpProtocol: tcp, FromPort: 53, ToPort: 53, CidrIp: 172.16.0.0/16, Description: DNS over TCP from on-prem }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-resolver-inbound-sg' }
+
+  ResolverOutboundSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Route 53 Resolver outbound endpoint - DNS to the on-prem DNS server only
+      VpcId: !Ref SharedVpc
+      SecurityGroupEgress:
+        - { IpProtocol: udp, FromPort: 53, ToPort: 53, CidrIp: 172.16.1.10/32, Description: DNS to on-prem server }
+        - { IpProtocol: tcp, FromPort: 53, ToPort: 53, CidrIp: 172.16.1.10/32, Description: DNS over TCP to on-prem server }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-resolver-outbound-sg' }
+
+  ResolverInboundEndpoint:
+    Type: AWS::Route53Resolver::ResolverEndpoint
+    Properties:
+      Name: !Sub '${ProjectName}-inbound'
+      Direction: INBOUND
+      SecurityGroupIds: [!Ref ResolverInboundSecurityGroup]
+      IpAddresses:
+        - { SubnetId: !Ref SharedSubnetA, Ip: 10.0.1.10 }
+        - { SubnetId: !Ref SharedSubnetB, Ip: 10.0.2.10 }
+
+  ResolverOutboundEndpoint:
+    Type: AWS::Route53Resolver::ResolverEndpoint
+    Properties:
+      Name: !Sub '${ProjectName}-outbound'
+      Direction: OUTBOUND
+      SecurityGroupIds: [!Ref ResolverOutboundSecurityGroup]
+      IpAddresses:
+        - { SubnetId: !Ref SharedSubnetA, Ip: 10.0.1.11 }
+        - { SubnetId: !Ref SharedSubnetB, Ip: 10.0.2.11 }
+
+  ResolverRuleCorp:
+    Type: AWS::Route53Resolver::ResolverRule
+    Properties:
+      Name: !Sub '${ProjectName}-forward-corp'
+      DomainName: corp.example.internal
+      RuleType: FORWARD
+      ResolverEndpointId: !Ref ResolverOutboundEndpoint
+      TargetIps:
+        - { Ip: 172.16.1.10, Port: '53' }
+
+  ResolverRuleAssocShared:
+    Type: AWS::Route53Resolver::ResolverRuleAssociation
+    Properties:
+      ResolverRuleId: !Ref ResolverRuleCorp
+      VPCId: !Ref SharedVpc
+
+  ResolverRuleAssocDev:
+    Type: AWS::Route53Resolver::ResolverRuleAssociation
+    Properties:
+      ResolverRuleId: !Ref ResolverRuleCorp
+      VPCId: !Ref DevVpc
+
+  ResolverRuleAssocStaging:
+    Type: AWS::Route53Resolver::ResolverRuleAssociation
+    Properties:
+      ResolverRuleId: !Ref ResolverRuleCorp
+      VPCId: !Ref StagingVpc
+
+  ResolverRuleAssocProd:
+    Type: AWS::Route53Resolver::ResolverRuleAssociation
+    Properties:
+      ResolverRuleId: !Ref ResolverRuleCorp
+      VPCId: !Ref ProdVpc
+
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: aws.example.internal
+      HostedZoneConfig:
+        Comment: !Sub '${ProjectName} private zone for AWS workloads'
+      VPCs:
+        - { VPCId: !Ref SharedVpc, VPCRegion: !Ref 'AWS::Region' }
+        - { VPCId: !Ref DevVpc, VPCRegion: !Ref 'AWS::Region' }
+        - { VPCId: !Ref StagingVpc, VPCRegion: !Ref 'AWS::Region' }
+        - { VPCId: !Ref ProdVpc, VPCRegion: !Ref 'AWS::Region' }
+
+  DnsRecordDev:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: app.dev.aws.example.internal
+      Type: A
+      TTL: '60'
+      ResourceRecords: [10.10.1.10]
+
+  DnsRecordStaging:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: app.staging.aws.example.internal
+      Type: A
+      TTL: '60'
+      ResourceRecords: [10.20.1.10]
+
+  DnsRecordProd:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: app.prod.aws.example.internal
+      Type: A
+      TTL: '60'
+      ResourceRecords: [10.30.1.10]
+
+  # ===========================================================================
+  # Test workloads (no internet access; reachable only over the private network)
+  # ===========================================================================
+  WorkloadLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-workload'
+      LaunchTemplateData:
+        ImageId: !Ref AmazonLinuxAmiId
+        InstanceType: !Ref InstanceType
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          InstanceMetadataTags: enabled
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            set -euxo pipefail
+            TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+            curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/tags/instance/Environment > /etc/workload-env
+            mkdir -p /var/www
+            echo "Starting..." > /var/www/index.html
+
+            # Every 30 seconds: test outbound hybrid DNS and the route back to on-prem, publish the result.
+            cat > /usr/local/bin/hybrid-status.sh <<'SCRIPT'
+            #!/bin/bash
+            ENV_NAME=$(cat /etc/workload-env)
+            SELF_IP=$(hostname -I | awk '{print $1}')
+            while true; do
+              CORP_IP=$(getent hosts fileserver.corp.example.internal | awk '{print $1}')
+              if [ -n "$CORP_IP" ]; then DNS_RESULT="OK (fileserver.corp.example.internal = $CORP_IP)"; else DNS_RESULT="FAILED"; fi
+              if ping -c 1 -W 2 172.16.2.20 > /dev/null 2>&1; then PING_RESULT="OK"; else PING_RESULT="FAILED"; fi
+              # Segmentation check: try the other environments' apps (expected: dev<->staging OK, prod BLOCKED)
+              REACH=""
+              for TARGET in dev:10.10.1.10 staging:10.20.1.10 prod:10.30.1.10; do
+                NAME=${TARGET%%:*}
+                IP=${TARGET#*:}
+                [ "$IP" = "$SELF_IP" ] && continue
+                if curl -s -m 3 -o /dev/null "http://$IP/"; then STATUS="OK"; else STATUS="BLOCKED"; fi
+                REACH+="Reach $NAME app ($IP):        $STATUS"$'\n'
+              done
+              cat > /var/www/index.html.tmp <<EOF
+            Hello from the $ENV_NAME VPC
+            Workload IP:                           $SELF_IP
+            Resolve on-prem name (outbound DNS):   $DNS_RESULT
+            Ping on-prem client 172.16.2.20:       $PING_RESULT
+            $REACH
+            Checked at (UTC):                      $(date -u +%Y-%m-%dT%H:%M:%SZ)
+            EOF
+              mv /var/www/index.html.tmp /var/www/index.html
+              sleep 30
+            done
+            SCRIPT
+            chmod 755 /usr/local/bin/hybrid-status.sh
+
+            cat > /etc/systemd/system/hybrid-status.service <<'EOF'
+            [Unit]
+            Description=Hybrid connectivity self-test
+            After=network-online.target
+            [Service]
+            ExecStart=/usr/local/bin/hybrid-status.sh
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            cat > /etc/systemd/system/hybrid-web.service <<'EOF'
+            [Unit]
+            Description=Minimal web server for connectivity tests
+            After=network-online.target
+            [Service]
+            ExecStart=/usr/bin/python3 -m http.server 80 --directory /var/www
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            systemctl daemon-reload
+            systemctl enable --now hybrid-status.service hybrid-web.service
+
+  DevWorkloadSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Dev workload - HTTP and ICMP from private networks
+      VpcId: !Ref DevVpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 172.16.0.0/16, Description: HTTP from on-prem }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 10.0.0.0/8, Description: HTTP from AWS VPCs }
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 172.16.0.0/16, Description: Ping from on-prem }
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 10.0.0.0/8, Description: Ping from AWS VPCs }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-dev-workload-sg' }
+
+  StagingWorkloadSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Staging workload - HTTP and ICMP from private networks
+      VpcId: !Ref StagingVpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 172.16.0.0/16, Description: HTTP from on-prem }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 10.0.0.0/8, Description: HTTP from AWS VPCs }
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 172.16.0.0/16, Description: Ping from on-prem }
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 10.0.0.0/8, Description: Ping from AWS VPCs }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-staging-workload-sg' }
+
+  ProdWorkloadSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Prod workload - HTTP and ICMP from private networks
+      VpcId: !Ref ProdVpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 172.16.0.0/16, Description: HTTP from on-prem }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 10.0.0.0/8, Description: HTTP from AWS VPCs }
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 172.16.0.0/16, Description: Ping from on-prem }
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 10.0.0.0/8, Description: Ping from AWS VPCs }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-prod-workload-sg' }
+
+  DevWorkload:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkloadLaunchTemplate
+        Version: !GetAtt WorkloadLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref DevSubnetA
+      PrivateIpAddress: 10.10.1.10
+      SecurityGroupIds: [!Ref DevWorkloadSecurityGroup]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-dev-app' }
+        - { Key: Environment, Value: dev }
+        - { Key: Project, Value: !Ref ProjectName }
+
+  StagingWorkload:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkloadLaunchTemplate
+        Version: !GetAtt WorkloadLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref StagingSubnetA
+      PrivateIpAddress: 10.20.1.10
+      SecurityGroupIds: [!Ref StagingWorkloadSecurityGroup]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-staging-app' }
+        - { Key: Environment, Value: staging }
+        - { Key: Project, Value: !Ref ProjectName }
+
+  ProdWorkload:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkloadLaunchTemplate
+        Version: !GetAtt WorkloadLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref ProdSubnetA
+      PrivateIpAddress: 10.30.1.10
+      SecurityGroupIds: [!Ref ProdWorkloadSecurityGroup]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-prod-app' }
+        - { Key: Environment, Value: prod }
+        - { Key: Project, Value: !Ref ProjectName }
+
+  # ===========================================================================
+  # Optional: AWS RAM share and VPN tunnel alarms
+  # ===========================================================================
+  NetworkResourceShare:
+    Type: AWS::RAM::ResourceShare
+    Condition: HasSharePrincipal
+    Properties:
+      Name: !Sub '${ProjectName}-network-share'
+      AllowExternalPrincipals: true
+      Principals: [!Ref SharePrincipal]
+      ResourceArns:
+        - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:transit-gateway/${TransitGateway}'
+        - !GetAtt ResolverRuleCorp.Arn
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  VpnAllTunnelsDownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlertEmail
+    Properties:
+      AlarmName: !Sub '${ProjectName}-vpn-all-tunnels-down'
+      AlarmDescription: Both VPN tunnels are down - on-prem connectivity is lost.
+      Namespace: AWS/VPN
+      MetricName: TunnelState
+      Dimensions:
+        - { Name: VpnId, Value: !Ref VpnConnection }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  VpnRedundancyLostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlertEmail
+    Properties:
+      AlarmName: !Sub '${ProjectName}-vpn-redundancy-lost'
+      AlarmDescription: At least one VPN tunnel is down - traffic has no redundant path.
+      Namespace: AWS/VPN
+      MetricName: TunnelState
+      Dimensions:
+        - { Name: VpnId, Value: !Ref VpnConnection }
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+Outputs:
+  TransitGatewayId:
+    Value: !Ref TransitGateway
+  VpnConnectionId:
+    Value: !Ref VpnConnection
+  VpnTgwAttachmentId:
+    Value: !GetAtt VpnAttachmentLookup.AttachmentId
+  CustomerGatewayPublicIp:
+    Description: Public IP of the simulated on-prem router (customer gateway).
+    Value: !Ref CgwElasticIp
+  CustomerGatewayInstanceId:
+    Description: Connect with Session Manager to check IPsec and BGP.
+    Value: !Ref CustomerGatewayInstance
+  OnPremClientInstanceId:
+    Description: Connect with Session Manager to run the connectivity tests.
+    Value: !Ref OnPremClientInstance
+  ResolverInboundIps:
+    Description: On-prem DNS forwards aws.example.internal to these IPs.
+    Value: 10.0.1.10, 10.0.2.10
+  TestCommands:
+    Description: Run on the on-prem client.
+    Value: dig app.prod.aws.example.internal +short ; curl http://app.dev.aws.example.internal ; traceroute -n 10.30.1.10
+  NetworkFirewallEnabled:
+    Value: !Ref EnableNetworkFirewall
